@@ -1,1 +1,2 @@
-base_dir = "invalid.toml"
+[invalid.key]
+this = "not valid"

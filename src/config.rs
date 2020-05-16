@@ -1,106 +1,66 @@
-use crate::pretty_error;
+use crate::errors::ConfigError;
 
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::error::Error;
-use std::fmt;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use git2::Repository;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 // TODO:
 // let conf be in .config/rema/config.toml, add option for config file
-// let base_dir choosable, default data_local_dir .local/share/rema/ (directory for repos)
-// 'add' command to automatically pull from repos => suckless, github, gitlab etc.
-// built in repo config editor? or just unify configs into main
 
+// info for each dir to look through
 #[derive(Debug, Deserialize, PartialEq, Eq)]
-struct Repo {
-    name: String,
-}
-
-// RemaConfig builder
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-struct RemaConfigSe {
-    base_dir: String,
-    ignore: Option<HashSet<String>>,
-    autoclean: Option<bool>,
-    autoupdate: Option<bool>,
-    #[serde(rename = "repo")]
-    repos: HashMap<String, Repo>,
-}
-
-// stores config
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RemaConfig {
-    base_dir: PathBuf,
+struct RemaDir {
+    #[serde(deserialize_with = "expand")]
+    path: PathBuf,
+    #[serde(default)]
+    include: HashSet<String>,
+    #[serde(default)]
     ignore: HashSet<String>,
+    #[serde(default)]
     autoclean: bool,
+    #[serde(default)]
     autoupdate: bool,
 }
 
-impl From<RemaConfigSe> for RemaConfig {
-    fn from(rcs: RemaConfigSe) -> Self {
-        Self {
-            base_dir: rcs.base_dir.expand().into(),
-            ignore: rcs.ignore.unwrap_or_default(),
-            autoclean: rcs.autoclean.unwrap_or_default(),
-            autoupdate: rcs.autoupdate.unwrap_or_default(),
-        }
-    }
+// Rema config
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct RemaConfig {
+    #[serde(rename = "dir")]
+    dirs: HashMap<String, RemaDir>,
+    #[serde(default)]
+    autoclean: bool,
+    #[serde(default)]
+    autoupdate: bool,
 }
-
-#[derive(Debug)]
-pub(crate) enum ConfigError {
-    BaseDirRelative(PathBuf),
-    BaseDirNotDir(PathBuf),
-    File(failure::Error),
-    Toml(failure::Error),
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BaseDirRelative(p) => {
-                write!(f, "base_dir in {:?} cannot be relative", p.to_str())
-            }
-            Self::BaseDirNotDir(p) => {
-                write!(f, "base_dir must be a directory, found: {:?}", p.to_str())
-            }
-            Self::File(e) => write!(f, "could not read config file: {}", pretty_error(e)),
-            Self::Toml(e) => write!(f, "error in config file: {}", pretty_error(e)),
-        }
-    }
-}
-impl Error for ConfigError {}
 
 impl RemaConfig {
     /// Creates a new RemaConfig instance, validating data
     pub(crate) fn new(config_match: Option<&str>) -> Result<Self, ConfigError> {
-        // if custom config not specified, fallback to CONFIG_DIR/rema.yml
+        // if custom config not specified, fallback to CONFIG_DIR/config.toml
+        // if dirs::config_dir fails, path to config needs to be provided
         let path: PathBuf = if let Some(s) = config_match {
             s.into()
         } else {
-            // TODO: handle properly, maybe cmd option
             let mut config_dir = dirs::config_dir().expect("could not find user config directory.");
-            config_dir.push("rema.conf");
+            config_dir.push("rema/config.toml");
             config_dir
         };
 
-        let buf = std::fs::read_to_string(path).map_err(|e| ConfigError::File(e.into()))?;
+        // bail on io error or deserialise error
+        let buf = std::fs::read_to_string(path).map_err(ConfigError::from)?;
+        let config: Self = toml::from_str(&buf).map_err(ConfigError::from)?;
 
-        let config: Self = toml::from_str::<RemaConfigSe>(&buf)
-            .map(|rcs| rcs.into())
-            .map_err(|e| ConfigError::Toml(e.into()))?;
-
-        if config.base_dir.is_relative() {
-            Err(ConfigError::BaseDirRelative(config.base_dir))
-        } else if !config.base_dir.is_dir() {
-            Err(ConfigError::BaseDirNotDir(config.base_dir))
-        } else {
-            Ok(config)
+        // check dirs are suitable
+        for RemaDir { path, .. } in config.dirs.values() {
+            if path.is_relative() {
+                return Err(ConfigError::BaseDirRelative(path.clone()));
+            } else if !path.is_dir() {
+                return Err(ConfigError::BaseDirNotDir(path.clone()));
+            }
         }
+        Ok(config)
     }
 }
 
@@ -109,14 +69,19 @@ impl IntoIterator for RemaConfig {
     type Item = Repository;
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
+    // TODO: redo to use correct ignore
     fn into_iter(self) -> Self::IntoIter {
-        std::fs::read_dir(self.base_dir.clone())
-            .expect("base_dir should be directory")
+        self.dirs
+            .values()
+            .map(|RemaDir { path, .. }| {
+                std::fs::read_dir(path).expect("base_dir should be directory")
+            })
+            .flatten()
             .filter_map(|entry| match entry {
                 Ok(e) => {
                     // check entry is directory and not in ignores list
-                    let s = e.file_name().into_string().unwrap();
-                    if e.path().is_file() || self.ignore.contains(&s) {
+                    let _s = e.file_name().into_string().unwrap();
+                    if e.path().is_file() {
                         None
                     } else {
                         Repository::open(e.path()).ok()
@@ -129,43 +94,24 @@ impl IntoIterator for RemaConfig {
     }
 }
 
-// BuildConfig builder
-// Result<T> types are optional in the rema.toml file
+// Config for building a repo
 #[derive(Debug, Deserialize)]
-pub(crate) struct BuildConfigSe {
+pub(crate) struct BuildConfig {
     name: String,
+    #[serde(rename = "name")]
+    path: PathBuf,
+    #[serde(default)]
     build: Vec<String>,
-    clean: Option<Vec<String>>,
-    autoclean: Option<bool>,
-    autoupdate: Option<bool>,
-}
-
-// Config for building a repos
-#[derive(Debug)]
-pub(crate) struct BuildConfig<'c> {
-    name: String,
-    path: &'c Path,
-    build: Vec<String>,
+    #[serde(default)]
     clean: Vec<String>,
+    #[serde(default)]
     autoclean: bool,
+    #[serde(default)]
     autoupdate: bool,
 }
 
-impl<'c> From<(BuildConfigSe, &'c Path)> for BuildConfig<'c> {
-    fn from((bcs, p): (BuildConfigSe, &'c Path)) -> Self {
-        Self {
-            name: bcs.name,
-            path: p,
-            build: bcs.build.expand(),
-            clean: bcs.clean.unwrap_or_default().expand(),
-            autoclean: bcs.autoclean.unwrap_or_default(),
-            autoupdate: bcs.autoupdate.unwrap_or_default(),
-        }
-    }
-}
-
-impl<'c> BuildConfig<'c> {
-    pub(crate) fn new(p: &'c Path) -> Self {
+impl<'c> BuildConfig {
+    pub(crate) fn new(p: PathBuf) -> Self {
         Self {
             name: p.to_str().unwrap().to_string(),
             path: p,
@@ -181,30 +127,20 @@ impl<'c> BuildConfig<'c> {
     }
 
     pub(crate) fn try_from_repo(repo: &'c Repository) -> Option<Self> {
-        let p = repo.path().to_path_buf().join("rema.toml");
+        let p = repo.path().to_path_buf();
+        let f = p.join("rema.toml");
 
-        if let Ok(buf) = std::fs::read_to_string(p.clone()) {
-            println!("Found config: {:?}", p.into_os_string());
-
-            match toml::from_str::<BuildConfigSe>(&buf) {
-                Ok(c) => {
-                    println!("{:#?}", c);
-                    Some((c, repo.path()).into())
-                }
-                Err(e) => {
-                    eprintln!("Error reading config to yaml: {}", e.to_string());
-                    None
-                }
-            }
+        if let Ok(buf) = std::fs::read_to_string(f) {
+            toml::from_str::<BuildConfig>(&buf).ok()
         } else {
-            Some(Self::new(repo.path()))
+            Some(Self::new(p))
         }
     }
 
     // returns wether update needed or not
     pub(crate) fn pull(&self) -> bool {
         let output = std::process::Command::new("git")
-            .current_dir(self.path)
+            .current_dir(self.path.as_path())
             .arg("pull")
             .output()
             .expect("failed to execute git");
@@ -242,13 +178,21 @@ impl<'c> BuildConfig<'c> {
         println!("exec: {} {:?} in {:?}", cmd, args, self.path);
 
         std::process::Command::new(cmd)
-            .current_dir(self.path)
+            .current_dir(self.path.as_path())
             .args(args)
             .spawn()
             .expect("failed to run command")
             .wait()
             .expect("command failed to run");
     }
+}
+
+fn expand<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    Ok(s.expand().into())
 }
 
 // Helper trait to shellexpand paths from configs
@@ -284,34 +228,33 @@ mod tests {
         std::env::set_var("HOME", HOME);
     }
 
-    // TODO: config test macro or function??
-
     #[test]
     fn test_rema_config_full() {
         set_home();
 
         let config = r#"
-                base_dir = "~"
+                autoclean = true
+                autoupdate = true
+
+                [dir.home]
+                path = "~"
                 ignore = ["a", "b", "c"]
                 autoclean = true
-                autoupdate = true"#;
+                autoupdate = true
+            "#;
 
         // check config is parsed correctly
-        let conf: RemaConfigSe = toml::from_str(&config).unwrap();
-        let expected = RemaConfigSe {
-            base_dir: "~".into(),
-            ignore: Some(hashset! {"a".into(), "b".into(), "c".into()}),
-            autoclean: Some(true),
-            autoupdate: Some(true),
-            repos: HashMap::new(),
-        };
-        assert_eq!(conf, expected);
-
-        // check `into` has converted properly
-        let conf: RemaConfig = conf.into();
+        let conf: RemaConfig = toml::from_str(&config).unwrap();
         let expected = RemaConfig {
-            base_dir: HOME.into(),
-            ignore: hashset! {"a".into(), "b".into(), "c".into()},
+            dirs: hashmap! {
+                "home".into() => RemaDir {
+                    path: HOME.into(),
+                    include: hashset!{},
+                    ignore: hashset! {"a".into(), "b".into(), "c".into()},
+                    autoclean: true,
+                    autoupdate: true,
+                }
+            },
             autoclean: true,
             autoupdate: true,
         };
@@ -323,29 +266,21 @@ mod tests {
         set_home();
 
         let config = r#"
-            base_dir = "~"
-            [repo.test]
-            name = "test repo"
+            [dir.home]
+            path = "~"
             "#;
-        let conf: RemaConfigSe = toml::from_str(config).unwrap();
-        let expected = RemaConfigSe {
-            base_dir: "~".into(),
-            ignore: None,
-            autoupdate: None,
-            autoclean: None,
-            repos: hashmap! {
-                    "test".into() =>
-                    Repo {
-                        name: "test repo".into(),
-                    },
-            },
-        };
-        assert_eq!(conf, expected);
 
-        let conf: RemaConfig = conf.into();
+        let conf: RemaConfig = toml::from_str(&config).unwrap();
         let expected = RemaConfig {
-            base_dir: HOME.into(),
-            ignore: hashset! {},
+            dirs: hashmap! {
+                "home".into() => RemaDir {
+                    path: HOME.into(),
+                    include: hashset!{},
+                    ignore: hashset!{},
+                    autoclean: false,
+                    autoupdate: false,
+                }
+            },
             autoclean: false,
             autoupdate: false,
         };
@@ -356,5 +291,11 @@ mod tests {
     #[should_panic]
     fn test_invalid_config() {
         RemaConfig::new(Some("invalid.toml")).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_invalid_config_path() {
+        RemaConfig::new(Some("nonexistantfile")).unwrap();
     }
 }

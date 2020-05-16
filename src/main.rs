@@ -1,6 +1,9 @@
 #![warn(clippy::all, clippy::pedantic, rust_2018_idioms)]
 
 pub(crate) mod config;
+pub(crate) mod errors;
+
+use crate::errors::pretty_error;
 
 use std::fs;
 use std::path::PathBuf;
@@ -81,17 +84,4 @@ fn main() {
             unreachable!("got subcommand: {}", s);
         }
     }
-}
-
-// https://github.com/BurntSushi/imdb-rename/blob/master/src/main.rs
-// /// Return a prettily formatted error, including its entire causal chain.
-pub fn pretty_error(err: &failure::Error) -> String {
-    let mut pretty = err.to_string();
-    let mut prev = err.as_fail();
-    while let Some(next) = prev.cause() {
-        pretty.push_str(": ");
-        pretty.push_str(&next.to_string());
-        prev = next;
-    }
-    pretty
 }
