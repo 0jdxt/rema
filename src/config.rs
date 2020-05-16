@@ -1,5 +1,6 @@
 use crate::pretty_error;
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
@@ -8,6 +9,17 @@ use std::path::{Path, PathBuf};
 use git2::Repository;
 use serde::Deserialize;
 
+// TODO:
+// let conf be in .config/rema/config.toml, add option for config file
+// let base_dir choosable, default data_local_dir .local/share/rema/ (directory for repos)
+// 'add' command to automatically pull from repos => suckless, github, gitlab etc.
+// built in repo config editor? or just unify configs into main
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct Repo {
+    name: String,
+}
+
 // RemaConfig builder
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct RemaConfigSe {
@@ -15,9 +27,11 @@ struct RemaConfigSe {
     ignore: Option<HashSet<String>>,
     autoclean: Option<bool>,
     autoupdate: Option<bool>,
+    #[serde(rename = "repo")]
+    repos: HashMap<String, Repo>,
 }
 
-// stores conifg
+// stores config
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RemaConfig {
     base_dir: PathBuf,
@@ -261,7 +275,7 @@ impl<T: ShellExpand> ShellExpand for Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maplit::hashset;
+    use maplit::{hashmap, hashset};
 
     const HOME: &str = "/home/randomuser";
 
@@ -289,6 +303,7 @@ mod tests {
             ignore: Some(hashset! {"a".into(), "b".into(), "c".into()}),
             autoclean: Some(true),
             autoupdate: Some(true),
+            repos: HashMap::new(),
         };
         assert_eq!(conf, expected);
 
@@ -307,13 +322,23 @@ mod tests {
     fn test_rema_config_minimal() {
         set_home();
 
-        let config = r#"base_dir = "~""#;
+        let config = r#"
+            base_dir = "~"
+            [repo.test]
+            name = "test repo"
+            "#;
         let conf: RemaConfigSe = toml::from_str(config).unwrap();
         let expected = RemaConfigSe {
             base_dir: "~".into(),
             ignore: None,
             autoupdate: None,
             autoclean: None,
+            repos: hashmap! {
+                    "test".into() =>
+                    Repo {
+                        name: "test repo".into(),
+                    },
+            },
         };
         assert_eq!(conf, expected);
 
